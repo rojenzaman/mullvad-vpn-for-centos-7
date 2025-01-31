@@ -1,8 +1,11 @@
 #!/bin/bash
 
-# Mullvad VPN automatic setup script with integrated kill switch and utility scripts generation
-# Enhanced with error handling and DNS configuration
-# Includes --generate-only, --default, and --dns1=<IP> arguments for flexible operation
+# Mullvad VPN automatic setup script with integrated kill switch (IPv4 + IPv6)
+# and utility scripts generation. Provides DNS leak prevention, error handling,
+# and supports --generate-only, --default, and --dns1=<IP> arguments.
+# 
+# Includes a function to detect and disable firewalld so that iptables-persistent
+# works properly on CentOS 7.
 
 set -e  # Exit immediately if a command exits with a non-zero status
 
@@ -20,41 +23,34 @@ error_exit() {
 # Help function
 show_help() {
     cat << EOF
-Mullvad VPN Setup Script
+Mullvad VPN Setup Script with IPv4 + IPv6 Kill Switch
 
 Usage:
-  $0 --default [--dns1=<IP>]        Run the full setup (system configurations and script generation)
-  $0 --generate-only                Generate the scripts without modifying system configurations
+  $0 --default [--dns1=<IP>]        Run the full setup (system configurations + script generation)
+  $0 --generate-only                Generate kill-switch.sh, restart.sh, and status.sh without system changes
   $0 --help                         Display this help message
 
 Options:
-  --dns1=<IP>                       Specify the DNS1 IP address to use (default: 100.64.0.63)
+  --dns1=<IP>    Specify the DNS1 IP address to use for IPv4 (default: 100.64.0.63)
 
 Description:
-  This script automates the setup of Mullvad VPN on a CentOS 7 server. It can perform the following actions:
+  This script automates Mullvad VPN setup on a CentOS 7 server. It:
+    - Stops/disables existing Mullvad OpenVPN services
+    - Removes old configs in /etc/openvpn/
+    - Copies new Mullvad configs to /etc/openvpn/
+    - Enables/starts Mullvad's systemd service
+    - Updates DNS settings in network config
+    - Generates the kill-switch.sh (with IPv4 + IPv6), restart.sh, and status.sh scripts
+    - Immediately applies and saves iptables + ip6tables rules (if --default)
+    - Ensures IPv6 traffic is also restricted to the VPN tunnel only
+    - Checks if firewalld is installed or active, disables it to avoid conflicts
 
-  --default:
-    - Stop and disable existing Mullvad OpenVPN services
-    - Remove existing OpenVPN configurations in /etc/openvpn/
-    - Copy Mullvad configuration files to /etc/openvpn/
-    - Enable and start the Mullvad OpenVPN systemd service
-    - Update DNS settings in the network configuration
-    - Generate the kill-switch.sh, restart.sh, and status.sh scripts
-    - Run the kill switch script and save iptables settings
-
-  --generate-only:
-    - Generate the kill-switch.sh, restart.sh, and status.sh scripts based on your VPN configuration
-    - Does NOT modify system configurations or iptables settings
-
-  --help:
-    - Display this help message and exit
-
-Ensure that this script is located in the same directory as your Mullvad configuration files.
+  Use --generate-only if you only want the scripts generated, without touching system configs or services.
 
 EOF
 }
 
-# Default DNS1 address
+# Default DNS1 address (Mullvad DNS)
 DNS1_DEFAULT="100.64.0.63"
 
 # Parse arguments
@@ -97,7 +93,7 @@ if [[ "$GENERATE_ONLY" == false && "$DEFAULT_MODE" == false ]]; then
 fi
 
 if [[ "$GENERATE_ONLY" == true ]]; then
-    log "Running in generate-only mode: System configurations and iptables will not be modified."
+    log "Running in generate-only mode: System configurations, iptables, and ip6tables will not be modified."
 fi
 
 if [[ "$DEFAULT_MODE" == true ]]; then
@@ -105,10 +101,30 @@ if [[ "$DEFAULT_MODE" == true ]]; then
     log "Using DNS1 address: $DNS1"
 fi
 
+# ---------------------------------------------------------------
+# Function to check and disable firewalld if it is installed/running
+# ---------------------------------------------------------------
+disable_firewalld_if_needed() {
+    log "Checking firewalld status..."
+    # Check if firewalld package is installed
+    if yum list installed firewalld &>/dev/null; then
+        log "firewalld package is installed."
+        # Check if firewalld service is active
+        if systemctl is-active --quiet firewalld; then
+            log "firewalld is running. Stopping and disabling..."
+            systemctl stop firewalld || error_exit "Failed to stop firewalld"
+            systemctl disable firewalld || error_exit "Failed to disable firewalld"
+            log "firewalld has been stopped and disabled."
+        else
+            log "firewalld service is not active. No action needed."
+        fi
+    else
+        log "firewalld package is not installed. No action needed."
+    fi
+}
+
 # Get the directory where the script is located
 script_dir="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
-
-# Determine the Mullvad directory based on the script's location
 mullvad_dir="$script_dir"
 
 # Find the Mullvad configuration directory that contains update-resolv-conf
@@ -121,6 +137,9 @@ fi
 
 # If not in generate-only mode, proceed with system modifications
 if [[ "$GENERATE_ONLY" == false ]]; then
+    # First, ensure firewalld is disabled so iptables services can work properly
+    disable_firewalld_if_needed
+
     # Stop and disable Mullvad OpenVPN services
     log "Stopping and disabling Mullvad OpenVPN services..."
     for conf_file in /etc/openvpn/mullvad_*.conf; do
@@ -166,9 +185,8 @@ if [[ "$GENERATE_ONLY" == false ]]; then
         error_exit "Mullvad configuration file not found in /etc/openvpn/"
     fi
 
-    # Update DNS1 line in the network configuration
+    # Update DNS1 line in the network configuration (eth0 assumed)
     log "Updating DNS1 line in network configuration..."
-
     network_config="/etc/sysconfig/network-scripts/ifcfg-eth0"
     if [[ -f "$network_config" ]]; then
         if grep -q '^DNS1=' "$network_config"; then
@@ -182,8 +200,7 @@ if [[ "$GENERATE_ONLY" == false ]]; then
         error_exit "Network configuration file $network_config not found"
     fi
 else
-    # In generate-only mode, set variables needed for script generation
-    # Assume mullvad_conf and service_name based on the configuration directory
+    # In generate-only mode, we just need mullvad_conf and service_name
     mullvad_conf_file=$(find "$config_dir" -name 'mullvad_*.conf' -print -quit)
     if [[ -f "$mullvad_conf_file" ]]; then
         mullvad_conf=$(basename "$mullvad_conf_file")
@@ -195,79 +212,135 @@ fi
 
 # Generate kill-switch.sh based on the OpenVPN configuration
 log "Generating kill-switch.sh script based on the OpenVPN configuration..."
+
 if [[ "$GENERATE_ONLY" == true ]]; then
     OPENVPN_CONF="$config_dir/$mullvad_conf"
 else
     OPENVPN_CONF="/etc/openvpn/$mullvad_conf"
 fi
+
 KILL_SWITCH_SCRIPT="$mullvad_dir/iptables/kill-switch.sh"
 
-# Ensure the OpenVPN configuration file exists
 if [[ ! -f "$OPENVPN_CONF" ]]; then
     error_exit "OpenVPN configuration file not found at $OPENVPN_CONF"
 fi
 
-# Extract remote server IPs and ports from the OpenVPN config
-REMOTE_ENTRIES=$(grep '^remote ' "$OPENVPN_CONF" | sed 's/#.*//')  # Remove comments
+# Extract remote server IPs and ports from the OpenVPN config (IPv4 or domain)
+REMOTE_ENTRIES=$(grep '^remote ' "$OPENVPN_CONF" | sed 's/#.*//')
 
 if [[ -z "$REMOTE_ENTRIES" ]]; then
-    error_exit "No remote entries found in $OPENVPN_CONF"
+    error_exit "No 'remote' entries found in $OPENVPN_CONF (cannot determine Mullvad server IP/port)."
 fi
 
-# Initialize arrays
 declare -A PORTS
 declare -A IPS
 
-# Parse the remote entries
 while read -r line; do
     read -a tokens <<< "$line"
-    # tokens[0] is 'remote', tokens[1] is IP, tokens[2] is port
     IP="${tokens[1]}"
     PORT="${tokens[2]}"
-    # Add to associative arrays to ensure uniqueness
     IPS["$IP"]=1
     PORTS["$PORT"]=1
 done <<< "$REMOTE_ENTRIES"
 
-# Create comma-separated lists of unique IPs and ports
 UNIQUE_IPS=$(echo "${!IPS[@]}" | tr ' ' ',')
 UNIQUE_PORTS=$(echo "${!PORTS[@]}" | tr ' ' ',')
 
-# Generate the kill-switch.sh script
 mkdir -p "$(dirname "$KILL_SWITCH_SCRIPT")"
 
+#
+# ENHANCED kill-switch.sh with IPv4 + IPv6 blocking rules
+#
 cat << EOF > "$KILL_SWITCH_SCRIPT"
 #!/bin/bash
 
-# Clear all existing rules
+# ============================
+# Enhanced Mullvad Kill Switch (IPv4 + IPv6)
+# ============================
+# This script enforces:
+# 1. All outbound IPv4 traffic (except local LAN) must go via tun0.
+# 2. All outbound IPv6 traffic must also go via tun0.
+# 3. DNS queries only to Mullvad IPv4 DNS ($DNS1) via tun0 (preventing DNS leaks).
+# 4. Only Mullvad server IPs/ports are allowed outbound on eth0 (UDP) before tun0 is up.
+# 5. Local LAN traffic (192.168.1.0/24) is always allowed for PBX or internal devices.
+# 6. IPv6 traffic (if used by Mullvad) is restricted to tun0, preventing IPv6 leaks.
+
+########## IPv4 iptables ##########
+# 1) Flush existing IPv4 rules
 iptables -F
 iptables -X
 
-# Set default policies for all chains to DROP
+# 2) Default DROP
 iptables -P INPUT DROP
 iptables -P FORWARD DROP
 iptables -P OUTPUT DROP
 
-# Allow traffic to/from localhost
+# 3) Allow all loopback
 iptables -A INPUT -i lo -j ACCEPT
 iptables -A OUTPUT -o lo -j ACCEPT
 
-# Allow traffic to/from VPN interface (tun0)
+# 4) Allow traffic via VPN (tun0)
 iptables -A INPUT -i tun0 -j ACCEPT
 iptables -A OUTPUT -o tun0 -j ACCEPT
 
-# Allow outgoing traffic to OpenVPN servers
-iptables -A OUTPUT -p udp -m multiport --dports $UNIQUE_PORTS -d $UNIQUE_IPS -j ACCEPT
-
-# Allow incoming traffic from OpenVPN servers
-iptables -A INPUT -p udp -m multiport --sports $UNIQUE_PORTS -s $UNIQUE_IPS -j ACCEPT
-
-# Allow traffic from/to local network
+# 5) Allow local LAN traffic (192.168.1.0/24)
 iptables -A INPUT -s 192.168.1.0/24 -j ACCEPT
 iptables -A OUTPUT -d 192.168.1.0/24 -j ACCEPT
+
+# 6) Allow outbound to Mullvad VPN servers (IPv4) - necessary before tun0 is up
+iptables -A OUTPUT -p udp -m multiport --dports $UNIQUE_PORTS -d $UNIQUE_IPS -j ACCEPT
+iptables -A INPUT -p udp -m multiport --sports $UNIQUE_PORTS -s $UNIQUE_IPS -j ACCEPT
+
+# 7) DNS leak prevention (IPv4 DNS)
+iptables -A OUTPUT -o tun0 -p udp --dport 53 -d $DNS1 -j ACCEPT
+iptables -A OUTPUT -o tun0 -p tcp --dport 53 -d $DNS1 -j ACCEPT
+iptables -A OUTPUT -p udp --dport 53 -j DROP
+iptables -A OUTPUT -p tcp --dport 53 -j DROP
+
+# 8) Block any other outbound IPv4 traffic that is NOT via tun0 (and not local or Mullvad servers)
+iptables -A OUTPUT ! -o tun0 -d 192.168.1.0/24 -j ACCEPT
+iptables -A OUTPUT ! -o tun0 -d $UNIQUE_IPS -j ACCEPT
+iptables -A OUTPUT ! -o tun0 -j DROP
+
+
+########## IPv6 ip6tables ##########
+# 1) Flush existing IPv6 rules
+ip6tables -F
+ip6tables -X
+
+# 2) Default DROP for IPv6
+ip6tables -P INPUT DROP
+ip6tables -P FORWARD DROP
+ip6tables -P OUTPUT DROP
+
+# 3) Allow loopback on IPv6
+ip6tables -A INPUT -i lo -j ACCEPT
+ip6tables -A OUTPUT -o lo -j ACCEPT
+
+# 4) Allow IPv6 via tun0
+ip6tables -A INPUT -i tun0 -j ACCEPT
+ip6tables -A OUTPUT -o tun0 -j ACCEPT
+
+# 5) Block all other IPv6 traffic that is NOT via tun0
+#    (If your LAN uses IPv6, you may add specific rules for that range,
+#     e.g. fe80::/10 for link-local, but typically it is safer to drop all.)
+ip6tables -A OUTPUT ! -o tun0 -j DROP
+ip6tables -A INPUT ! -i tun0 -j DROP
+
+# If Mullvad provides IPv6 server addresses, you would explicitly allow them here
+# For example:
+# ip6tables -A OUTPUT -p udp --dport 1300:1302 -d 2620:123:45:: -j ACCEPT
+# ip6tables -A INPUT -p udp --sport 1300:1302 -s 2620:123:45:: -j ACCEPT
+# (Adjust as needed if remote lines contain IPv6 addresses)
+
+# DNS leak prevention for IPv6:
+# If Mullvad offers a known IPv6 DNS, you can allow it specifically via tun0.
+# Otherwise, block all DNS queries over IPv6:
+ip6tables -A OUTPUT -p udp --dport 53 -j DROP
+ip6tables -A OUTPUT -p tcp --dport 53 -j DROP
+
 EOF
 
-# Make the kill-switch script executable
 chmod +x "$KILL_SWITCH_SCRIPT" || error_exit "Failed to set execute permissions on $KILL_SWITCH_SCRIPT"
 log "Kill switch script generated at $KILL_SWITCH_SCRIPT"
 
@@ -289,29 +362,38 @@ cat << EOF > "$STATUS_SCRIPT"
 #!/bin/bash
 
 systemctl status "$service_name"
-curl https://am.i.mullvad.net/connected
+curl -s https://am.i.mullvad.net/connected
 EOF
 chmod +x "$STATUS_SCRIPT" || error_exit "Failed to set execute permissions on $STATUS_SCRIPT"
 log "Status script generated at $STATUS_SCRIPT"
 
+# Apply iptables and start service (if --default)
 if [[ "$GENERATE_ONLY" == false ]]; then
-    # Run the kill switch script
-    log "Running kill switch script..."
+    # Run the kill-switch.sh to enforce the firewall rules
+    log "Running kill-switch.sh script to enforce iptables and ip6tables rules..."
     if [[ -x "$KILL_SWITCH_SCRIPT" ]]; then
         "$KILL_SWITCH_SCRIPT" || error_exit "Kill switch script failed"
     else
         error_exit "Kill switch script not found or not executable at $KILL_SWITCH_SCRIPT"
     fi
 
-    # Save iptables settings
-    log "Saving iptables settings..."
-    service iptables save || error_exit "Failed to save iptables settings"
+    # Save IPv4 iptables
+    log "Saving iptables (IPv4) settings..."
+    service iptables save || error_exit "Failed to save IPv4 iptables settings"
 
-    # Start the Mullvad systemd service
+    # Save IPv6 ip6tables
+    log "Saving ip6tables (IPv6) settings..."
+    service ip6tables save || error_exit "Failed to save IPv6 ip6tables settings"
+
+    # Enable the iptables and ip6tables services to preserve rules on reboot
+    systemctl enable iptables || error_exit "Failed to enable iptables service"
+    systemctl enable ip6tables || error_exit "Failed to enable ip6tables service"
+
+    # Finally, start the Mullvad service
     log "Starting Mullvad systemd service..."
     systemctl start "$service_name" || error_exit "Failed to start $service_name"
 
-    # Check the status of the Mullvad service
+    # Check Mullvad service status
     log "Checking Mullvad service status..."
     if systemctl is-active --quiet "$service_name"; then
         log "Mullvad service $service_name is running"
@@ -323,4 +405,3 @@ else
 fi
 
 log "Setup completed successfully."
-
